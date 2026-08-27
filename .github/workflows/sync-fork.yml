@@ -1,0 +1,164 @@
+# 工作流名称
+# 保存后会在 GitHub 仓库的 Actions 左侧看到“Sync Fork”
+name: Sync Fork
+
+# 工作流触发条件
+on:
+  # 定时自动执行
+  schedule:
+    # Cron 表达式使用 UTC 时间
+    # 表示每天 UTC 02:17 执行一次
+    # 对应北京时间每天 10:17
+    - cron: "17 2 * * *"
+
+  # 允许在 GitHub 的 Actions 页面手动执行
+  # 操作路径：
+  # Actions → Sync Fork → Run workflow
+  workflow_dispatch:
+
+# 授予工作流修改当前 Fork 仓库代码的权限
+# 如果没有这个权限，最后执行 git push 时会失败
+permissions:
+  contents: write
+
+# 并发控制
+# 防止上一次同步还没结束，下一次同步又开始运行
+concurrency:
+  # 同一时间只允许一个 sync-fork 工作流运行
+  group: sync-fork
+
+  # 如果已经有任务运行，新任务等待，不强制取消旧任务
+  cancel-in-progress: false
+
+# 工作流中的任务
+jobs:
+  sync:
+    # 任务在 Actions 页面显示的名称
+    name: Sync upstream repository
+
+    # 使用 GitHub 提供的 Ubuntu 云端运行环境
+    # 不需要准备自己的服务器
+    runs-on: ubuntu-latest
+
+    steps:
+      # 第一步：把当前 Fork 仓库下载到运行环境
+      - name: Checkout fork repository
+        uses: actions/checkout@v6
+        with:
+          # 下载完整的 Git 提交历史
+          # 如果只下载最近一次提交，后续合并上游代码可能失败
+          fetch-depth: 0
+
+      # 第二步：自动识别当前仓库、上游仓库和默认分支
+      - name: Detect fork and upstream repository
+        # 给当前步骤设置 ID
+        # 后面的步骤可以通过这个 ID 获取识别结果
+        id: repository
+
+        env:
+          # GitHub 自动生成的临时令牌
+          # 用于调用 GitHub API
+          # 不需要自己创建 Token
+          GH_TOKEN: ${{ github.token }}
+
+        shell: bash
+
+        run: |
+          # 开启严格错误检查：
+          # -e：任何命令失败时立即停止
+          # -u：使用未定义变量时立即停止
+          # -o pipefail：管道中的任意命令失败都视为失败
+          set -euo pipefail
+
+          # 判断当前仓库是不是真正的 GitHub Fork
+          # 返回值通常为 true 或 false
+          IS_FORK="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.fork')"
+
+          # 获取当前 Fork 仓库的默认分支
+          # 通常是 main，也可能是 master
+          FORK_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+
+          # 获取原始仓库的完整名称
+          # 例如：openai/codex
+          UPSTREAM_REPO="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
+
+          # 获取原始仓库的默认分支
+          # 通常是 main，也可能是 master
+          UPSTREAM_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.default_branch // empty')"
+
+          # 如果当前仓库不是 Fork，则无法自动查找原始仓库
+          if [ "${IS_FORK}" != "true" ]; then
+            echo "::error::当前仓库不是 GitHub Fork，无法自动定位原始仓库。"
+            exit 1
+          fi
+
+          # 如果没有识别到原始仓库或默认分支，则终止任务
+          if [ -z "${UPSTREAM_REPO}" ] || [ -z "${UPSTREAM_BRANCH}" ]; then
+            echo "::error::未能识别原始仓库或原始仓库默认分支。"
+            exit 1
+          fi
+
+          # 将识别结果提供给后面的同步步骤使用
+          echo "fork_branch=${FORK_BRANCH}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_repo=${UPSTREAM_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_branch=${UPSTREAM_BRANCH}" >> "${GITHUB_OUTPUT}"
+
+          # 在 Actions 运行日志中打印识别结果
+          # 方便检查脚本是否定位到了正确的项目
+          echo "当前 Fork 仓库：${GITHUB_REPOSITORY}"
+          echo "Fork 默认分支：${FORK_BRANCH}"
+          echo "原始上游仓库：${UPSTREAM_REPO}"
+          echo "上游默认分支：${UPSTREAM_BRANCH}"
+
+      # 第三步：下载并合并原始仓库的最新代码
+      - name: Merge upstream changes
+        env:
+          # 读取上一步自动识别出来的信息
+          FORK_BRANCH: ${{ steps.repository.outputs.fork_branch }}
+          UPSTREAM_REPO: ${{ steps.repository.outputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ steps.repository.outputs.upstream_branch }}
+
+        shell: bash
+
+        run: |
+          # 同样开启严格错误检查
+          set -euo pipefail
+
+          # 设置自动提交代码时使用的 GitHub Actions 机器人身份
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 删除可能已经存在的 upstream 配置
+          # 如果不存在，不会让任务失败
+          git remote remove upstream 2>/dev/null || true
+
+          # 将原始仓库添加为 upstream
+          # 例如：https://github.com/openai/codex.git
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+          # 获取当前 Fork 默认分支的最新状态
+          git fetch origin "${FORK_BRANCH}"
+
+          # 获取原始仓库的所有最新分支和提交
+          # --prune 会清理上游已经删除的远程分支引用
+          git fetch upstream --prune
+
+          # 切换到当前 Fork 的默认分支
+          git checkout "${FORK_BRANCH}"
+
+          # 将原始仓库默认分支的更新合并到 Fork 默认分支
+          # --no-edit 表示自动使用默认的合并提交说明
+          #
+          # 这里没有使用 --force，因此不会强制覆盖自己的代码
+          # 如果存在冲突，工作流会安全失败
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+
+          # 判断合并后的代码和 GitHub 上的 Fork 分支是否存在差异
+          if git diff --quiet "origin/${FORK_BRANCH}..${FORK_BRANCH}"; then
+            # 没有差异，说明已经是最新状态
+            echo "当前 Fork 已经是最新版本，无需推送。"
+          else
+            # 存在更新，将合并结果推送到当前 Fork 仓库
+            git push origin "${FORK_BRANCH}"
+            echo "Fork 仓库同步完成。"
+          fi
