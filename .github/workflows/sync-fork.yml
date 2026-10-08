@@ -1,10 +1,10 @@
 name: Sync Upstream
 
 on:
-  schedule:
-    # 沿用北京时间：每周一凌晨 03:17 执行一次
-    - cron: "17 3 * * 1"
-      timezone: "Asia/Shanghai"
+  # schedule:
+  #  # 沿用北京时间：每周一凌晨 03:17 执行一次
+  #  - cron: "17 3 * * 1"
+  #    timezone: "Asia/Shanghai"
 
   # 保留 Actions 页面上的手动执行按钮
   workflow_dispatch:
